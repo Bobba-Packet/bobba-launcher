@@ -1,0 +1,18 @@
+node_modules/
+dist/
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.*
+
+# Tauri / Rust
+src-tauri/target/
+
+# Local reference sources (not shipped)
+.ref-HabboCustomLauncher/
+
+# Editor
+.idea/
+.vscode/*
+!.vscode/extensions.json

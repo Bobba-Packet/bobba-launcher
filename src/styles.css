@@ -1,0 +1,46 @@
+@import "tailwindcss";
+
+@font-face {
+  font-family: "GrapeSoda";
+  src: url("/fonts/GrapeSoda.ttf") format("truetype");
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "KiwiSoda";
+  src: url("/fonts/KiwiSoda.ttf") format("truetype");
+  font-display: swap;
+}
+
+@theme {
+  --color-bp-bg: #12130f;
+  --color-bp-surface: #1d1f19;
+  --color-bp-fg: #eae6e5;
+  --color-bp-muted: #9aa8c0;
+  --color-bp-accent: #138a36;
+  --color-bp-accent-hover: #18b447;
+  --color-bp-border: #262b1c;
+  --font-display: "GrapeSoda", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Ubuntu", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: var(--color-bp-bg);
+  color: var(--color-bp-fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
