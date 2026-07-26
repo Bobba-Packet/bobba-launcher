@@ -36,11 +36,17 @@ pub fn parse_ticket(raw: &str) -> Option<LoginTicket> {
     let server_id = parts[0].to_string();
     let host = hotels::host_for_server_id(&server_id)?;
     let sso_ticket = format!("{}.{}", parts[1], parts[2]);
-    let username = if parts.len() > 3 {
-        Some(parts[3..].join("."))
-    } else {
-        None
-    };
+    // Skip empty segments, e.g. `…V4..carol` → "carol"
+    let username = parts
+        .get(3..)
+        .map(|rest| {
+            rest.iter()
+                .filter(|s| !s.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+        .filter(|name| !name.is_empty());
 
     Some(LoginTicket {
         server_id,

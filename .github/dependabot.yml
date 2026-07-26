@@ -1,0 +1,16 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: weekly
+    ignore:
+      # Locked by Tauri Linux GTK3 stack (gtk 0.18 / webkit2gtk → glib 0.18).
+      # gtk3-rs is EOL; glib ≥0.20 needs Tauri GTK4 migration (GHSA-wrw7-89jp-8q8g).
+      - dependency-name: "glib"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]

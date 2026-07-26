@@ -22,11 +22,19 @@ const autoDownloadUpdates = ref(true);
 const launcherVersion = ref("");
 const pendingUpdate = ref<LauncherUpdate | null>(null);
 const updatingLauncher = ref(false);
+/** Seconds left before auto-launch; null when idle. */
+const launchCountdown = ref<number | null>(null);
+
+const LAUNCH_DELAY_SEC = 5;
 
 let unlisten: UnlistenFn | null = null;
 let unlistenUpdate: UnlistenFn | null = null;
+let unlistenDeepLink: UnlistenFn | null = null;
 let clipboardTimer: ReturnType<typeof setInterval> | null = null;
+let countdownTimer: ReturnType<typeof setInterval> | null = null;
 let lastClipboard = "";
+let lastDeepLinkUrl = "";
+let lastDeepLinkAt = 0;
 
 const active = computed(
   () => clients.value.find((c) => c.id === selected.value) ?? null,
@@ -43,6 +51,9 @@ const ticketLabel = computed(() => {
 
 const statusLabel = computed(() => {
   if (!active.value) return "";
+  if (launchCountdown.value != null) {
+    return `Launching ${active.value.label} in ${launchCountdown.value}s — pick a version`;
+  }
   if (progress.value) return progress.value;
   if (active.value.ready) {
     return active.value.version
@@ -53,8 +64,36 @@ const statusLabel = computed(() => {
 });
 
 const canPlay = computed(
-  () => !!ticket.value && !!active.value?.supported && !busy.value && !updatingLauncher.value,
+  () =>
+    !!ticket.value &&
+    !!active.value?.supported &&
+    !busy.value &&
+    !updatingLauncher.value,
 );
+
+function clearLaunchCountdown() {
+  if (countdownTimer) {
+    clearInterval(countdownTimer);
+    countdownTimer = null;
+  }
+  launchCountdown.value = null;
+}
+
+function startLaunchCountdown() {
+  clearLaunchCountdown();
+  if (!ticket.value || !active.value?.supported) return;
+
+  launchCountdown.value = LAUNCH_DELAY_SEC;
+  countdownTimer = setInterval(() => {
+    const next = (launchCountdown.value ?? 1) - 1;
+    if (next <= 0) {
+      clearLaunchCountdown();
+      void play();
+      return;
+    }
+    launchCountdown.value = next;
+  }, 1000);
+}
 
 async function refresh() {
   clients.value = await invoke<ClientStatus[]>("list_clients");
@@ -79,8 +118,8 @@ async function toggleAutoDownload(enabled: boolean) {
   }
 }
 
-async function applyTicketRaw(raw: string) {
-  if (raw === lastClipboard) return;
+async function applyTicketRaw(raw: string, force = false): Promise<boolean> {
+  if (!force && raw === lastClipboard) return false;
   lastClipboard = raw;
   ticketRaw.value = raw;
 
@@ -92,7 +131,16 @@ async function applyTicketRaw(raw: string) {
     error.value = null;
     // Keep hotel host in sync for Classic installs (silent)
     await invoke("set_default_hotel", { host: parsed.serverHost });
+    return true;
   }
+  return false;
+}
+
+async function onNewTicket(raw: string) {
+  const ok = await applyTicketRaw(raw, true);
+  if (!ok) return;
+  await invoke("show_launcher");
+  startLaunchCountdown();
 }
 
 async function pollClipboard() {
@@ -100,14 +148,25 @@ async function pollClipboard() {
   try {
     const text = (await readText()) ?? "";
     if (!text.trim()) {
-      if (ticket.value) {
+      // Keep ticket during countdown; only clear when idle
+      if (ticket.value && launchCountdown.value == null) {
         ticket.value = null;
         ticketRaw.value = "";
         lastClipboard = "";
       }
       return;
     }
-    await applyTicketRaw(text);
+    if (text === lastClipboard) return;
+
+    const parsed = await invoke<LoginTicket | null>("parse_login_ticket", {
+      raw: text,
+    });
+    if (parsed) {
+      await onNewTicket(text);
+    } else {
+      // Remember non-ticket clipboard so we don't re-parse every poll
+      lastClipboard = text;
+    }
   } catch {
     // Clipboard can fail briefly while another app locks it
   }
@@ -138,6 +197,7 @@ async function install() {
 }
 
 async function play() {
+  clearLaunchCountdown();
   if (!active.value?.supported) return;
   if (!ticketRaw.value.trim() || !ticket.value) {
     error.value = "Copy your Habbo login ticket first (habbo:// link).";
@@ -188,6 +248,23 @@ async function checkLauncherUpdates() {
   }
 }
 
+async function handleHabboUrl(raw: string): Promise<boolean> {
+  const now = Date.now();
+  // single-instance + deep-link can both fire for the same click
+  if (raw === lastDeepLinkUrl && now - lastDeepLinkAt < 1500) return false;
+  lastDeepLinkUrl = raw;
+  lastDeepLinkAt = now;
+
+  await onNewTicket(raw);
+  return !!ticket.value;
+}
+
+async function handleStartupTicket(): Promise<boolean> {
+  const raw = await invoke<string | null>("get_startup_ticket");
+  if (!raw) return false;
+  return handleHabboUrl(raw);
+}
+
 onMounted(async () => {
   try {
     await refresh();
@@ -204,7 +281,12 @@ onMounted(async () => {
         progress.value = `${event.payload.message}${pct}`;
       },
     );
-    await pollClipboard();
+    // Second-instance / deep-link while already running
+    unlistenDeepLink = await listen<string>("habbo-deep-link", (event) => {
+      void handleHabboUrl(event.payload);
+    });
+    const launchedFromUrl = await handleStartupTicket();
+    if (!launchedFromUrl) await pollClipboard();
     clipboardTimer = setInterval(() => {
       void pollClipboard();
     }, 800);
@@ -217,13 +299,15 @@ onMounted(async () => {
 onUnmounted(() => {
   unlisten?.();
   unlistenUpdate?.();
+  unlistenDeepLink?.();
   if (clipboardTimer) clearInterval(clipboardTimer);
+  clearLaunchCountdown();
 });
 </script>
 
 <template>
-  <div class="flex h-full flex-col overflow-hidden bg-bp-bg px-7 py-6">
-    <header class="mb-5 flex shrink-0 items-center justify-between gap-4">
+  <div class="flex h-full flex-col items-center overflow-hidden bg-bp-bg px-7 py-6">
+    <header class="relative mb-5 flex w-full shrink-0 items-center justify-center">
       <img
         src="/brand/logo-bobba-launcher-full.svg"
         alt="Bobba Launcher"
@@ -232,18 +316,18 @@ onUnmounted(() => {
       >
       <span
         v-if="launcherVersion"
-        class="text-[11px] uppercase tracking-wider text-bp-muted/70"
+        class="absolute right-0 text-[11px] uppercase tracking-wider text-bp-muted/70"
       >
         v{{ launcherVersion }}
       </span>
     </header>
 
-    <main class="flex min-h-0 flex-1 flex-col">
+    <main class="flex min-h-0 w-full flex-1 flex-col items-center justify-center">
       <p class="mb-3 text-xs uppercase tracking-widest text-bp-muted">
         Client version
       </p>
 
-      <div class="flex gap-2">
+      <div class="flex w-full gap-2">
         <button
           v-for="client in clients"
           :key="client.id"
@@ -268,12 +352,18 @@ onUnmounted(() => {
         </button>
       </div>
 
-      <div class="mt-5 space-y-2">
+      <div class="mt-5 w-full space-y-2 text-center">
         <p
           class="text-sm"
           :class="ticket ? 'text-bp-accent' : 'text-bp-muted'"
         >
           {{ ticketLabel }}
+        </p>
+        <p
+          v-if="launchCountdown != null"
+          class="font-display text-2xl tabular-nums text-bp-accent"
+        >
+          {{ launchCountdown }}
         </p>
         <p v-if="active" class="text-xs text-bp-muted/80">
           {{ statusLabel }}
@@ -313,7 +403,7 @@ onUnmounted(() => {
         </button>
       </div>
 
-      <div class="mt-auto flex items-center justify-between gap-3 pt-6">
+      <div class="mt-2 flex items-center justify-center gap-3 pt-6">
         <button
           type="button"
           class="rounded-md border border-bp-border px-4 py-2.5 text-sm text-bp-fg transition-colors hover:border-bp-accent hover:text-bp-accent disabled:opacity-40"
@@ -328,7 +418,11 @@ onUnmounted(() => {
           :disabled="!canPlay"
           @click="play"
         >
-          Play{{ active ? ` ${active.label}` : "" }}
+          {{
+            launchCountdown != null
+              ? `Play now · ${active?.label ?? ""}`
+              : `Play${active ? ` ${active.label}` : ""}`
+          }}
         </button>
       </div>
     </main>

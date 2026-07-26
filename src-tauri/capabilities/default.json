@@ -8,7 +8,13 @@
     "core:event:default",
     "opener:default",
     "dialog:default",
+    "deep-link:default",
     "clipboard-manager:allow-read-text",
-    "clipboard-manager:allow-write-text"
+    "clipboard-manager:allow-write-text",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:window:allow-unminimize",
+    "core:tray:default"
   ]
 }

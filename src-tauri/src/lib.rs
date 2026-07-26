@@ -9,9 +9,70 @@ mod updater;
 use clients::{ClientId, ClientStatus};
 use settings::Settings;
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use ticket::LoginTicket;
 use updater::LauncherUpdate;
+
+fn extract_habbo_url(args: &[String]) -> Option<String> {
+    args.iter()
+        .find(|arg| arg.trim_start_matches('"').starts_with("habbo://"))
+        .map(|arg| arg.trim_matches('"').to_string())
+}
+
+fn focus_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+#[tauri::command]
+fn show_launcher(app: AppHandle) {
+    focus_main_window(&app);
+}
+
+fn emit_habbo_url(app: &AppHandle, url: String) {
+    let _ = app.emit("habbo-deep-link", url);
+}
+
+fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let show_i = MenuItem::with_id(app, "show", "Open Launcher", true, None::<&str>)?;
+    let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
+
+    let icon = app
+        .default_window_icon()
+        .ok_or("missing window icon")?
+        .clone();
+
+    TrayIconBuilder::new()
+        .icon(icon)
+        .tooltip("Bobba Launcher")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => focus_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                focus_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+
+    Ok(())
+}
 
 struct AppState {
     settings: Mutex<Settings>,
@@ -118,6 +179,13 @@ fn parse_login_ticket(raw: String) -> Option<LoginTicket> {
     ticket::parse_ticket(&raw)
 }
 
+/// habbo:// URL the launcher was started with (protocol handler invocation), if any.
+#[tauri::command]
+fn get_startup_ticket() -> Option<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    extract_habbo_url(&args)
+}
+
 #[tauri::command]
 async fn install_client(
     app: AppHandle,
@@ -201,10 +269,51 @@ async fn launch_client(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Must be early so a second habbo:// launch is forwarded here
+        // instead of opening another window.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            focus_main_window(app);
+            if let Some(url) = extract_habbo_url(&argv) {
+                emit_habbo_url(app, url);
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
+            // Register habbo:// for the current exe so links work from the
+            // first run onwards, even in dev or portable installs.
+            #[cfg(desktop)]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let _ = app.deep_link().register_all();
+
+                // Cold-start / OS delivery of deep links (macOS / some Windows paths)
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        let s = url.as_str().to_string();
+                        if s.starts_with("habbo://") {
+                            emit_habbo_url(&handle, s);
+                        }
+                    }
+                });
+
+                setup_tray(app)?;
+            }
+
+            // Closing the window hides to tray so clipboard watching continues.
+            if let Some(window) = app.get_webview_window("main") {
+                let win = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = win.hide();
+                    }
+                });
+            }
+
             let settings = load_settings(app.handle());
             app.manage(AppState {
                 settings: Mutex::new(settings),
@@ -224,6 +333,8 @@ pub fn run() {
             check_launcher_update,
             download_launcher_update,
             parse_login_ticket,
+            get_startup_ticket,
+            show_launcher,
             install_client,
             launch_client,
         ])
