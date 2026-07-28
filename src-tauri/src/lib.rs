@@ -222,10 +222,6 @@ async fn launch_client(
     let ticket = ticket::parse_ticket(&ticket_raw)
         .ok_or_else(|| "Invalid login ticket. Paste a habbo:// link or server.ticket.V4 code.".to_string())?;
 
-    if !id.supported() {
-        return Err("AirBobba is not available yet".into());
-    }
-
     let root = install::data_root(&app)?;
     let host = ticket.server_host.clone();
 

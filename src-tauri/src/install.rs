@@ -2,6 +2,7 @@
 //!
 //! Classic = official AIR from hotel `/gamedata/clienturls`
 //! AirPlus = HabboAir.swf from HabboAirPlus releases + AirPlus patch
+//! AirBobba = HabboAir.swf from HabboAirBobba releases + Bobba patch
 
 use std::fs::{self, File};
 use std::io::{copy, Write};
@@ -19,6 +20,12 @@ const USER_AGENT: &str =
 
 const AIRPLUS_SWF_URL: &str =
     "https://github.com/LilithRainbows/HabboAirPlus/releases/download/latest/HabboAir.swf";
+
+const AIRBOBBA_SWF_URL: &str =
+    "https://github.com/Bobba-Packet/HabboAirBobba/releases/download/latest/HabboAir.swf";
+
+const AIRBOBBA_PATCH_URL: &str =
+    "https://github.com/Bobba-Packet/HabboAirBobba/releases/download/latest/HabboAirBobbaPatch.zip";
 
 const ASSET_BASE: &str =
     "https://raw.githubusercontent.com/LilithRainbows/HabboCustomLauncher/main/Assets";
@@ -204,15 +211,15 @@ async fn fetch_official_clienturls(hotel_host: &str) -> Result<(String, String),
     Ok((parsed.flash_windows_version, parsed.flash_windows))
 }
 
-async fn airplus_version() -> Result<String, String> {
+async fn github_swf_version(swf_url: &str) -> Result<String, String> {
     // Stable folder name: avoid Utc::now() which created a new broken install on every launch.
     // Prefer Last-Modified epoch when GitHub returns it; otherwise a fixed pin.
     let client = http_client()?;
     let response = client
-        .head(AIRPLUS_SWF_URL)
+        .head(swf_url)
         .send()
         .await
-        .map_err(|e| format!("AirPlus HEAD failed: {e}"))?;
+        .map_err(|e| format!("SWF HEAD failed ({swf_url}): {e}"))?;
     if response.status().is_success() {
         if let Some(lm) = response.headers().get(reqwest::header::LAST_MODIFIED) {
             let s = lm.to_str().unwrap_or("");
@@ -234,6 +241,20 @@ async fn airplus_version() -> Result<String, String> {
     Ok("latest".into())
 }
 
+async fn airplus_version() -> Result<String, String> {
+    github_swf_version(AIRPLUS_SWF_URL).await
+}
+
+async fn airbobba_version() -> Result<String, String> {
+    github_swf_version(AIRBOBBA_SWF_URL).await
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SwfClientKind {
+    AirPlus,
+    AirBobba,
+}
+
 pub async fn ensure_installed(
     app: &AppHandle,
     root: &Path,
@@ -241,22 +262,25 @@ pub async fn ensure_installed(
     hotel_host: &str,
 ) -> Result<(String, PathBuf), String> {
     if !id.supported() {
-        return Err("AirBobba is not available yet".into());
+        return Err(format!("{} is not available yet", id.label()));
     }
     if !cfg!(target_os = "windows") {
         return Err("Install pipeline is currently Windows-only".into());
     }
 
-    let (version, client_url, is_airplus) = match id {
+    let (version, client_url, swf_kind) = match id {
         ClientId::Classic => {
             let (v, u) = fetch_official_clienturls(hotel_host).await?;
-            (v, u, false)
+            (v, u, None)
         }
         ClientId::AirPlus => {
             let v = airplus_version().await?;
-            (v, AIRPLUS_SWF_URL.to_string(), true)
+            (v, AIRPLUS_SWF_URL.to_string(), Some(SwfClientKind::AirPlus))
         }
-        ClientId::AirBobba => unreachable!(),
+        ClientId::AirBobba => {
+            let v = airbobba_version().await?;
+            (v, AIRBOBBA_SWF_URL.to_string(), Some(SwfClientKind::AirBobba))
+        }
     };
 
     let dest = client_dir(root, id, &version)?;
@@ -273,7 +297,7 @@ pub async fn ensure_installed(
     fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
 
     // 1) Download client payload
-    let payload_path = if is_airplus {
+    let payload_path = if swf_kind.is_some() {
         let swf = dest.join("HabboAir.swf");
         download_file(app, &client_url, &swf, "HabboAir.swf").await?;
         swf
@@ -291,23 +315,32 @@ pub async fn ensure_installed(
 
     // 3) Client contents
     emit_progress(app, "extract", None, "Extracting client…");
-    if is_airplus {
-        let plus_zip = download_asset_zip(app, "HabboAirPlusPatch.zip", &dest).await?;
-        unzip(&plus_zip, &dest, &[])?;
-        let _ = fs::remove_file(&plus_zip);
-    } else {
-        // Official package — keep AIR shell Habbo.exe from patch
-        unzip(
-            &payload_path,
-            &dest,
-            &[
-                "Adobe AIR",
-                "META-INF/signatures.xml",
-                "META-INF/AIR/hash",
-                "Habbo.exe",
-            ],
-        )?;
-        let _ = fs::remove_file(&payload_path);
+    match swf_kind {
+        Some(SwfClientKind::AirPlus) => {
+            let plus_zip = download_asset_zip(app, "HabboAirPlusPatch.zip", &dest).await?;
+            unzip(&plus_zip, &dest, &[])?;
+            let _ = fs::remove_file(&plus_zip);
+        }
+        Some(SwfClientKind::AirBobba) => {
+            let bobba_zip = dest.join("HabboAirBobbaPatch.zip");
+            download_file(app, AIRBOBBA_PATCH_URL, &bobba_zip, "HabboAirBobbaPatch.zip").await?;
+            unzip(&bobba_zip, &dest, &[])?;
+            let _ = fs::remove_file(&bobba_zip);
+        }
+        None => {
+            // Official package — keep AIR shell Habbo.exe from patch
+            unzip(
+                &payload_path,
+                &dest,
+                &[
+                    "Adobe AIR",
+                    "META-INF/signatures.xml",
+                    "META-INF/AIR/hash",
+                    "Habbo.exe",
+                ],
+            )?;
+            let _ = fs::remove_file(&payload_path);
+        }
     }
 
     // Align with working HabboCustomLauncher layout (META xml only, no Discord extensions)

@@ -23,7 +23,7 @@ impl ClientId {
         match self {
             ClientId::Classic => "Official Habbo AIR client (hotel gamedata).",
             ClientId::AirPlus => "HabboAirPlus — enhanced AIR client.",
-            ClientId::AirBobba => "Bobba Packet client — coming soon.",
+            ClientId::AirBobba => "Bobba Client — branded AirPlus build from Bobba Packet.",
         }
     }
 
@@ -32,12 +32,12 @@ impl ClientId {
         match self {
             ClientId::Classic => Some("air"),
             ClientId::AirPlus => Some("airplus"),
-            ClientId::AirBobba => None,
+            ClientId::AirBobba => Some("airbobba"),
         }
     }
 
     pub fn supported(self) -> bool {
-        !matches!(self, ClientId::AirBobba)
+        true
     }
 }
 
