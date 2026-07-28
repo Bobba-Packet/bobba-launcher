@@ -143,36 +143,50 @@ pub async fn download_and_install(app: &AppHandle, update: &LauncherUpdate) -> R
     let total = response.content_length();
     let temp_dir = std::env::temp_dir().join("bobba-launcher-update");
     std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
-    let dest: PathBuf = temp_dir.join(&update.asset_name);
 
-    let mut file = tokio::fs::File::create(&dest)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut stream = response.bytes_stream();
-    let mut downloaded: u64 = 0;
+    // Unique path per attempt so a stuck previous download cannot lock the name.
+    let dest: PathBuf = temp_dir.join(format!(
+        "{}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        &update.asset_name
+    ));
 
-    use tokio::io::AsyncWriteExt;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
-        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-        downloaded += chunk.len() as u64;
-        let percent = total.map(|t| {
-            if t == 0 {
-                0
-            } else {
-                ((downloaded as f64 / t as f64) * 100.0).round() as u32
-            }
-        });
-        let _ = app.emit(
-            "launcher-update-progress",
-            serde_json::json!({
-                "stage": "download",
-                "percent": percent,
-                "message": format!("Downloading launcher v{}…", update.version),
-            }),
-        );
+    {
+        let mut file = tokio::fs::File::create(&dest)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut stream = response.bytes_stream();
+        let mut downloaded: u64 = 0;
+
+        use tokio::io::AsyncWriteExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| e.to_string())?;
+            file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+            downloaded += chunk.len() as u64;
+            let percent = total.map(|t| {
+                if t == 0 {
+                    0
+                } else {
+                    ((downloaded as f64 / t as f64) * 100.0).round() as u32
+                }
+            });
+            let _ = app.emit(
+                "launcher-update-progress",
+                serde_json::json!({
+                    "stage": "download",
+                    "percent": percent,
+                    "message": format!("Downloading launcher v{}…", update.version),
+                }),
+            );
+        }
+        file.flush().await.map_err(|e| e.to_string())?;
+        file.sync_all().await.map_err(|e| e.to_string())?;
+        // File must be fully closed before Windows will allow CreateProcess on it.
     }
-    file.flush().await.map_err(|e| e.to_string())?;
 
     let _ = app.emit(
         "launcher-update-progress",
@@ -183,19 +197,42 @@ pub async fn download_and_install(app: &AppHandle, update: &LauncherUpdate) -> R
         }),
     );
 
-    // NSIS setup: passive UI, no blocking prompts when possible
+    // NSIS setup: silent install so it can replace binaries after we quit.
     let is_setup = update.asset_name.to_lowercase().contains("setup");
-    let mut cmd = std::process::Command::new(&dest);
-    if is_setup {
-        cmd.args(["/S", "/PASSIVE"]);
+    let mut last_err = String::new();
+    for attempt in 0..8u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(150 * u64::from(attempt))).await;
+        }
+        let mut cmd = std::process::Command::new(&dest);
+        if is_setup {
+            cmd.arg("/S");
+        }
+        match cmd.spawn() {
+            Ok(_) => {
+                // Quit so the installer can replace the running binary
+                app.exit(0);
+                return Ok(());
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                // ERROR_SHARING_VIOLATION / antivirus scan — retry briefly
+                let retryable = last_err.contains("sendo usado")
+                    || last_err.contains("being used")
+                    || last_err.contains("os error 32")
+                    || last_err.contains("Sharing violation");
+                if !retryable {
+                    break;
+                }
+            }
+        }
     }
 
-    cmd.spawn()
-        .map_err(|e| format!("Failed to start updater: {e}"))?;
-
-    // Quit so the installer can replace the running binary
-    app.exit(0);
-    Ok(())
+    Err(format!(
+        "Failed to start updater ({}): {last_err}. Close other Bobba Launcher windows and try again, or install manually from {}",
+        dest.display(),
+        update.html_url
+    ))
 }
 
 pub fn current_version(app: &AppHandle) -> String {
