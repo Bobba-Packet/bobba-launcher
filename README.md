@@ -3,7 +3,7 @@
 Tauri launcher for **Classic AIR**, **AirPlus**, and (later) **AirBobba**.
 
 **Organization:** https://github.com/Bobba-Packet  
-**Repo:** https://github.com/Bobba-Packet/launcher  
+**Repo:** https://github.com/Bobba-Packet/bobba-launcher  
 **License:** [GPL-3.0](./LICENSE)
 
 > Community project. Not affiliated with Sulake.
@@ -67,4 +67,4 @@ The **Release** workflow builds production and attaches the compiled Windows ins
 
 ### Auto-updates
 
-On launch, the app checks the [latest GitHub Release](https://github.com/Bobba-Packet/launcher/releases/latest). With **Auto-download launcher updates** enabled (default), it downloads the setup `.exe` and runs the installer.
+On launch, the app checks the [latest GitHub Release](https://github.com/Bobba-Packet/bobba-launcher/releases/latest). With **Auto-download launcher updates** enabled (default), it downloads the setup `.exe` and runs the installer.

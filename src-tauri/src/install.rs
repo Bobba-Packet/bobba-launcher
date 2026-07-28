@@ -2,7 +2,7 @@
 //!
 //! Classic = official AIR from hotel `/gamedata/clienturls`
 //! AirPlus = HabboAir.swf from HabboAirPlus releases + AirPlus patch
-//! AirBobba = HabboAir.swf from HabboAirBobba releases + Bobba patch
+//! AirBobba = HabboAir.swf from bobba-client releases + Bobba patch
 
 use std::fs::{self, File};
 use std::io::{copy, Write};
@@ -22,10 +22,10 @@ const AIRPLUS_SWF_URL: &str =
     "https://github.com/LilithRainbows/HabboAirPlus/releases/download/latest/HabboAir.swf";
 
 const AIRBOBBA_SWF_URL: &str =
-    "https://github.com/Bobba-Packet/HabboAirBobba/releases/download/latest/HabboAir.swf";
+    "https://github.com/Bobba-Packet/bobba-client/releases/download/latest/HabboAir.swf";
 
 const AIRBOBBA_PATCH_URL: &str =
-    "https://github.com/Bobba-Packet/HabboAirBobba/releases/download/latest/HabboAirBobbaPatch.zip";
+    "https://github.com/Bobba-Packet/bobba-client/releases/download/latest/HabboAirBobbaPatch.zip";
 
 const ASSET_BASE: &str =
     "https://raw.githubusercontent.com/LilithRainbows/HabboCustomLauncher/main/Assets";

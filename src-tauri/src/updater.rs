@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
 
-const GITHUB_REPO: &str = "Bobba-Packet/launcher";
+const GITHUB_REPO: &str = "Bobba-Packet/bobba-launcher";
 const USER_AGENT: &str = "Bobba-Launcher";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
