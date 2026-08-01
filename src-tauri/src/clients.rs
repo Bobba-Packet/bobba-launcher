@@ -9,13 +9,13 @@ pub enum ClientId {
 }
 
 impl ClientId {
-    pub const ALL: [ClientId; 3] = [ClientId::Classic, ClientId::AirPlus, ClientId::AirBobba];
+    pub const ALL: [ClientId; 3] = [ClientId::Classic, ClientId::AirBobba, ClientId::AirPlus];
 
     pub fn label(self) -> &'static str {
         match self {
             ClientId::Classic => "Classic",
             ClientId::AirPlus => "AirPlus",
-            ClientId::AirBobba => "AirBobba",
+            ClientId::AirBobba => "Bobba Client",
         }
     }
 

@@ -2,7 +2,7 @@
 //!
 //! Classic = official AIR from hotel `/gamedata/clienturls`
 //! AirPlus = HabboAir.swf from HabboAirPlus releases + AirPlus patch
-//! AirBobba = HabboAir.swf from bobba-client releases + Bobba patch
+//! AirBobba (Bobba Client) = HabboAir.swf from bobba-client releases + Bobba patch
 
 use std::fs::{self, File};
 use std::io::{copy, Write};
@@ -21,14 +21,33 @@ const USER_AGENT: &str =
 const AIRPLUS_SWF_URL: &str =
     "https://github.com/LilithRainbows/HabboAirPlus/releases/download/latest/HabboAir.swf";
 
-const AIRBOBBA_SWF_URL: &str =
-    "https://github.com/Bobba-Packet/bobba-client/releases/download/latest/HabboAir.swf";
-
-const AIRBOBBA_PATCH_URL: &str =
-    "https://github.com/Bobba-Packet/bobba-client/releases/download/latest/HabboAirBobbaPatch.zip";
+const AIRBOBBA_GITHUB_REPO: &str = "Bobba-Packet/bobba-client";
 
 const ASSET_BASE: &str =
     "https://raw.githubusercontent.com/LilithRainbows/HabboCustomLauncher/main/Assets";
+
+#[derive(Debug, Deserialize)]
+struct GhRelease {
+    tag_name: String,
+    assets: Vec<GhAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhAsset {
+    name: String,
+    updated_at: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteClient {
+    /// Folder / VERSION.txt identity — changes when GitHub ships a new build.
+    version: String,
+    /// HabboAir.swf download URL (or Classic zip URL).
+    client_url: String,
+    /// Extra patch zip for AirBobba, if any.
+    patch_url: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -241,18 +260,136 @@ async fn github_swf_version(swf_url: &str) -> Result<String, String> {
     Ok("latest".into())
 }
 
-async fn airplus_version() -> Result<String, String> {
-    github_swf_version(AIRPLUS_SWF_URL).await
-}
-
-async fn airbobba_version() -> Result<String, String> {
-    github_swf_version(AIRBOBBA_SWF_URL).await
-}
-
 #[derive(Debug, Clone, Copy)]
 enum SwfClientKind {
     AirPlus,
     AirBobba,
+}
+
+async fn resolve_remote_client(
+    id: ClientId,
+    hotel_host: &str,
+) -> Result<(RemoteClient, Option<SwfClientKind>), String> {
+    match id {
+        ClientId::Classic => {
+            let (version, client_url) = fetch_official_clienturls(hotel_host).await?;
+            Ok((
+                RemoteClient {
+                    version,
+                    client_url,
+                    patch_url: None,
+                },
+                None,
+            ))
+        }
+        ClientId::AirPlus => {
+            let version = github_swf_version(AIRPLUS_SWF_URL).await?;
+            Ok((
+                RemoteClient {
+                    version,
+                    client_url: AIRPLUS_SWF_URL.to_string(),
+                    patch_url: None,
+                },
+                Some(SwfClientKind::AirPlus),
+            ))
+        }
+        ClientId::AirBobba => Ok((fetch_bobba_client_release().await?, Some(SwfClientKind::AirBobba))),
+    }
+}
+
+/// Latest bobba-client GitHub Release — version includes SWF asset stamp so
+/// republished builds on the same tag still trigger a download.
+async fn fetch_bobba_client_release() -> Result<RemoteClient, String> {
+    let url = format!("https://api.github.com/repos/{AIRBOBBA_GITHUB_REPO}/releases/latest");
+    let client = http_client()?;
+    let response = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("bobba-client releases request failed: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "bobba-client releases request failed ({})",
+            response.status()
+        ));
+    }
+
+    let release: GhRelease = response
+        .json()
+        .await
+        .map_err(|e| format!("Invalid bobba-client release JSON: {e}"))?;
+    let tag = release.tag_name.trim();
+    if tag.is_empty() {
+        return Err("bobba-client latest release has an empty tag".into());
+    }
+
+    let swf = release
+        .assets
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case("HabboAir.swf"))
+        .ok_or_else(|| "bobba-client latest release is missing HabboAir.swf".to_string())?;
+    let patch = release
+        .assets
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case("HabboAirBobbaPatch.zip"))
+        .ok_or_else(|| "bobba-client latest release is missing HabboAirBobbaPatch.zip".to_string())?;
+
+    let stamp = asset_version_stamp(&swf.updated_at);
+    let version = sanitize_version_folder(&format!("{tag}_{stamp}"));
+
+    Ok(RemoteClient {
+        version,
+        client_url: swf.browser_download_url.clone(),
+        patch_url: Some(patch.browser_download_url.clone()),
+    })
+}
+
+fn asset_version_stamp(updated_at: &str) -> String {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(updated_at) {
+        return dt.timestamp().to_string();
+    }
+    sanitize_version_folder(updated_at)
+}
+
+fn sanitize_version_folder(raw: &str) -> String {
+    let safe: String = raw
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c => c,
+        })
+        .collect();
+    if safe.is_empty() {
+        "latest".into()
+    } else {
+        safe
+    }
+}
+
+fn read_installed_version(dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(dir.join("VERSION.txt")).ok()?;
+    let v = raw.trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+/// True when the on-disk install matches the remote version identity.
+fn is_version_current(dir: &Path, remote_version: &str) -> bool {
+    is_install_healthy(dir) && read_installed_version(dir).as_deref() == Some(remote_version)
+}
+
+/// Remove a previous install folder after a successful version bump.
+pub fn remove_install(root: &Path, id: ClientId, version: &str) {
+    if let Ok(dir) = client_dir(root, id, version) {
+        if dir.exists() {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
 }
 
 pub async fn ensure_installed(
@@ -268,28 +405,35 @@ pub async fn ensure_installed(
         return Err("Install pipeline is currently Windows-only".into());
     }
 
-    let (version, client_url, swf_kind) = match id {
-        ClientId::Classic => {
-            let (v, u) = fetch_official_clienturls(hotel_host).await?;
-            (v, u, None)
-        }
-        ClientId::AirPlus => {
-            let v = airplus_version().await?;
-            (v, AIRPLUS_SWF_URL.to_string(), Some(SwfClientKind::AirPlus))
-        }
-        ClientId::AirBobba => {
-            let v = airbobba_version().await?;
-            (v, AIRBOBBA_SWF_URL.to_string(), Some(SwfClientKind::AirBobba))
-        }
-    };
+    emit_progress(
+        app,
+        "check",
+        None,
+        format!("Verifying latest {} version…", id.label()),
+    );
 
+    let (remote, swf_kind) = resolve_remote_client(id, hotel_host).await?;
+    let version = remote.version.clone();
     let dest = client_dir(root, id, &version)?;
-    if is_install_healthy(&dest) {
-        // Keep layout aligned with HabboCustomLauncher before reporting ready
+
+    // Skip download only when local VERSION.txt matches the remote build id.
+    if is_version_current(&dest, &version) {
         let _ = normalize_air_application_xml(&dest);
-        emit_progress(app, "ready", Some(100), "Client already installed");
+        emit_progress(
+            app,
+            "ready",
+            Some(100),
+            format!("{} is up to date ({version})", id.label()),
+        );
         return Ok((version, dest));
     }
+
+    emit_progress(
+        app,
+        "update",
+        Some(0),
+        format!("Downloading {} {version}…", id.label()),
+    );
 
     if dest.exists() {
         fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
@@ -299,11 +443,11 @@ pub async fn ensure_installed(
     // 1) Download client payload
     let payload_path = if swf_kind.is_some() {
         let swf = dest.join("HabboAir.swf");
-        download_file(app, &client_url, &swf, "HabboAir.swf").await?;
+        download_file(app, &remote.client_url, &swf, "HabboAir.swf").await?;
         swf
     } else {
         let zip = dest.join("ClientDownload.zip");
-        download_file(app, &client_url, &zip, "official client").await?;
+        download_file(app, &remote.client_url, &zip, "official client").await?;
         zip
     };
 
@@ -322,8 +466,12 @@ pub async fn ensure_installed(
             let _ = fs::remove_file(&plus_zip);
         }
         Some(SwfClientKind::AirBobba) => {
+            let patch_url = remote
+                .patch_url
+                .as_deref()
+                .ok_or_else(|| "Missing HabboAirBobbaPatch.zip URL".to_string())?;
             let bobba_zip = dest.join("HabboAirBobbaPatch.zip");
-            download_file(app, AIRBOBBA_PATCH_URL, &bobba_zip, "HabboAirBobbaPatch.zip").await?;
+            download_file(app, patch_url, &bobba_zip, "HabboAirBobbaPatch.zip").await?;
             unzip(&bobba_zip, &dest, &[])?;
             let _ = fs::remove_file(&bobba_zip);
         }

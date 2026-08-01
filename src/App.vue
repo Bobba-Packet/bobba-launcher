@@ -205,7 +205,7 @@ async function play() {
   }
   busy.value = true;
   error.value = null;
-  progress.value = "Launching…";
+  progress.value = "Checking for updates…";
   try {
     await invoke("launch_client", {
       id: selected.value,

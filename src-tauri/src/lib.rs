@@ -199,7 +199,17 @@ async fn install_client(
     };
 
     let root = install::data_root(&app)?;
+    let previous_version = {
+        let settings = state.settings.lock().map_err(|e| e.to_string())?;
+        settings.version_of(id)
+    };
     let (version, _path) = install::ensure_installed(&app, &root, id, &host).await?;
+
+    if let Some(prev) = previous_version.as_ref() {
+        if *prev != version {
+            install::remove_install(&root, id, prev);
+        }
+    }
 
     let settings_snapshot = {
         let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
@@ -224,36 +234,41 @@ async fn launch_client(
 
     let root = install::data_root(&app)?;
     let host = ticket.server_host.clone();
-
-    // Ensure client exists / is updated using the ticket's hotel for Classic
-    let version = {
+    let previous_version = {
         let settings = state.settings.lock().map_err(|e| e.to_string())?;
         settings.version_of(id)
     };
 
-    let client_path = match version {
-        Some(v) => match install::resolve_install(&root, id, &v) {
-            Ok(p) => p,
-            Err(_) => {
-                // Try repairing incomplete AirPlus installs (extensions missing)
-                let maybe = install::client_dir(&root, id, &v)?;
-                if install::repair_if_needed(&app, &maybe).await.is_ok() {
-                    maybe
-                } else {
-                    let (v, p) = install::ensure_installed(&app, &root, id, &host).await?;
-                    let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
-                    settings.set_version(id, v);
-                    save_settings(&app, &settings)?;
-                    p
+    // Always verify the remote build before starting HabboAir.swf / Habbo.exe.
+    // On mismatch, download the latest from GitHub (or hotel gamedata for Classic).
+    // If the network is down, fall back to the last healthy local install.
+    let client_path = match install::ensure_installed(&app, &root, id, &host).await {
+        Ok((version, path)) => {
+            if let Some(prev) = previous_version.as_ref() {
+                if *prev != version {
+                    install::remove_install(&root, id, prev);
                 }
             }
-        },
-        None => {
-            let (v, p) = install::ensure_installed(&app, &root, id, &host).await?;
             let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
-            settings.set_version(id, v);
+            settings.set_version(id, version);
             save_settings(&app, &settings)?;
-            p
+            path
+        }
+        Err(update_err) => {
+            let Some(prev) = previous_version.as_ref() else {
+                return Err(update_err);
+            };
+            match install::resolve_install(&root, id, prev) {
+                Ok(path) => path,
+                Err(_) => {
+                    let maybe = install::client_dir(&root, id, prev)?;
+                    if install::repair_if_needed(&app, &maybe).await.is_ok() {
+                        maybe
+                    } else {
+                        return Err(update_err);
+                    }
+                }
+            }
         }
     };
 

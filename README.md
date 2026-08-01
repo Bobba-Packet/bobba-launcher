@@ -1,6 +1,6 @@
 # Bobba Launcher
 
-Tauri launcher for **Classic AIR**, **AirPlus**, and (later) **AirBobba**.
+Tauri launcher for **Classic AIR**, **AirPlus**, and **Bobba Client**.
 
 **Organization:** https://github.com/Bobba-Packet  
 **Repo:** https://github.com/Bobba-Packet/bobba-launcher  
@@ -16,7 +16,7 @@ Install/launch flow follows [HabboCustomLauncher](https://github.com/LilithRainb
 |---|---|---|
 | Classic (official AIR) | ✅ Windows | ✅ needs login ticket |
 | AirPlus | ✅ Windows | ✅ needs login ticket |
-| AirBobba | ⏳ stub | ⏳ |
+| Bobba Client | ✅ Windows | ✅ needs login ticket |
 
 ## Requirements
 
