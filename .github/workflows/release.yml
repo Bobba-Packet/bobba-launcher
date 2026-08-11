@@ -32,6 +32,50 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Build release notes
+        id: notes
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          SETUP="https://github.com/Bobba-Packet/bobba-launcher/releases/download/${TAG}/Bobba.Launcher_${VERSION}_x64-setup.exe"
+          PORTABLE="https://github.com/Bobba-Packet/bobba-launcher/releases/download/${TAG}/bobba-launcher_windows_x64.exe"
+          LATEST="https://github.com/Bobba-Packet/bobba-launcher/releases/latest"
+          CLIENT="https://github.com/Bobba-Packet/bobba-client/releases/latest"
+
+          NOTES=$(cat <<MD
+          # Bobba Launcher \`${TAG}\`
+
+          ## Downloads (Windows)
+
+          - **[Setup installer](${SETUP})** — recommended (auto-update)
+          - **[Portable .exe](${PORTABLE})** — no install
+          - Always available: **[latest release](${LATEST})**
+          - Bobba Client standalone: **[client releases](${CLIENT})**
+
+          ---
+
+          ### English
+          Production build of Bobba Launcher \`${TAG}\` for Windows (Classic, AirPlus, Bobba Client). Prefer the **setup installer** unless you need a portable binary. Versioning is managed via GitHub Releases; with auto-update enabled, the launcher can download newer builds from the latest release.
+
+          ### Português
+          Build de produção do Bobba Launcher \`${TAG}\` para Windows (Classic, AirPlus, Bobba Client). Prefira o **instalador (setup)**; use o portable se não quiser instalar. As versões ficam nas GitHub Releases; com auto-update ligado, o launcher baixa atualizações da última release.
+
+          ### Español
+          Build de producción de Bobba Launcher \`${TAG}\` para Windows (Classic, AirPlus, Bobba Client). Usa el **instalador (setup)** salvo que necesites el portable. Las versiones viven en GitHub Releases; con auto-update activo, el launcher descarga actualizaciones del último release.
+          MD
+          )
+
+          # Strip the common leading indent from the YAML block
+          NOTES=$(printf '%s\n' "$NOTES" | sed 's/^          //')
+
+          {
+            echo 'body<<EOF'
+            printf '%s\n' "$NOTES"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and publish GitHub Release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -39,14 +83,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Bobba Launcher ${{ github.ref_name }}
-          releaseBody: |
-            Production build of Bobba Launcher `${{ github.ref_name }}`.
-
-            ## Downloads
-            - **Setup installer** (`.exe`) — recommended
-            - Plain binary also attached when available
-
-            Versioning is managed via GitHub Releases. The launcher can auto-download updates from the latest release.
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: false
           prerelease: false
           generateReleaseNotes: true
