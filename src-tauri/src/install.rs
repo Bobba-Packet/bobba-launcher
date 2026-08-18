@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use zip::ZipArchive;
 
-use crate::clients::ClientId;
+use crate::clients::{ClientId, ClientKind};
 
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HabboLauncher/1.0.41 BobbaPacketLauncher/0.1";
@@ -97,6 +97,17 @@ fn http_client() -> Result<reqwest::Client, String> {
         .timeout(std::time::Duration::from_secs(600))
         .build()
         .map_err(|e| e.to_string())
+}
+
+/// Public wrapper so other modules (custom SWF) can reuse the progress-reporting
+/// downloader.
+pub async fn download_to(
+    app: &AppHandle,
+    url: &str,
+    dest: &Path,
+    label: &str,
+) -> Result<(), String> {
+    download_file(app, url, dest, label).await
 }
 
 async fn download_file(
@@ -200,34 +211,80 @@ fn set_swf_version(path: &Path, version: u8) -> Result<(), String> {
     fs::write(path, data).map_err(|e| e.to_string())
 }
 
+/// `/gamedata/clienturls` — the same document shape is served by every platform,
+/// but each only populates the keys relevant to it: `www.habbo.com` has the flash
+/// and unity keys, `www.habbox.game` only unity, `origins.habbo.com` only
+/// shockwave. Everything is therefore optional.
 #[derive(Debug, Deserialize)]
 struct ClientUrlsJson {
     #[serde(rename = "flash-windows-version")]
-    flash_windows_version: String,
+    flash_windows_version: Option<String>,
     #[serde(rename = "flash-windows")]
-    flash_windows: String,
+    flash_windows: Option<String>,
+    #[serde(rename = "unity-windows-version")]
+    unity_windows_version: Option<String>,
+    #[serde(rename = "unity-windows")]
+    unity_windows: Option<String>,
+    #[serde(rename = "shockwave-windows-version")]
+    shockwave_windows_version: Option<String>,
+    #[serde(rename = "shockwave-windows")]
+    shockwave_windows: Option<String>,
 }
 
-async fn fetch_official_clienturls(hotel_host: &str) -> Result<(String, String), String> {
-    let host = hotel_host
+async fn fetch_clienturls(host: &str) -> Result<ClientUrlsJson, String> {
+    let host = host
         .trim()
         .trim_start_matches("https://")
-        .trim_start_matches("http://");
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
     let url = format!("https://{host}/gamedata/clienturls");
     let client = http_client()?;
     let text = client
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("clienturls request failed: {e}"))?
+        .map_err(|e| format!("clienturls request failed ({host}): {e}"))?
         .error_for_status()
-        .map_err(|e| format!("clienturls HTTP error: {e}"))?
+        .map_err(|e| format!("clienturls HTTP error ({host}): {e}"))?
         .text()
         .await
         .map_err(|e| e.to_string())?;
-    let parsed: ClientUrlsJson =
-        serde_json::from_str(&text).map_err(|e| format!("Invalid clienturls JSON: {e}"))?;
-    Ok((parsed.flash_windows_version, parsed.flash_windows))
+    serde_json::from_str(&text).map_err(|e| format!("Invalid clienturls JSON from {host}: {e}"))
+}
+
+async fn fetch_official_clienturls(hotel_host: &str) -> Result<(String, String), String> {
+    let parsed = fetch_clienturls(hotel_host).await?;
+    let version = parsed
+        .flash_windows_version
+        .ok_or_else(|| "clienturls has no flash-windows-version".to_string())?;
+    let url = parsed
+        .flash_windows
+        .ok_or_else(|| "clienturls has no flash-windows URL".to_string())?;
+    Ok((version, url))
+}
+
+/// Version + zip URL for a Unity build (regular Unity client, or Habbo X).
+async fn fetch_unity_clienturls(host: &str) -> Result<(String, String), String> {
+    let parsed = fetch_clienturls(host).await?;
+    let version = parsed
+        .unity_windows_version
+        .ok_or_else(|| format!("{host} clienturls has no unity-windows-version"))?;
+    let url = parsed
+        .unity_windows
+        .ok_or_else(|| format!("{host} clienturls has no unity-windows URL"))?;
+    Ok((version, url))
+}
+
+/// Version + zip URL for the Origins (Shockwave) client.
+async fn fetch_shockwave_clienturls(host: &str) -> Result<(String, String), String> {
+    let parsed = fetch_clienturls(host).await?;
+    let version = parsed
+        .shockwave_windows_version
+        .ok_or_else(|| format!("{host} clienturls has no shockwave-windows-version"))?;
+    let url = parsed
+        .shockwave_windows
+        .ok_or_else(|| format!("{host} clienturls has no shockwave-windows URL"))?;
+    Ok((version, url))
 }
 
 async fn github_swf_version(swf_url: &str) -> Result<String, String> {
@@ -294,6 +351,12 @@ async fn resolve_remote_client(
             ))
         }
         ClientId::AirBobba => Ok((fetch_bobba_client_release().await?, Some(SwfClientKind::AirBobba))),
+        // Unity / Habbo X / Origins never reach here — they install through
+        // ensure_zip_installed, which resolves its own URLs.
+        other => Err(format!(
+            "{} is not an AIR client and has no SWF payload",
+            other.label()
+        )),
     }
 }
 
@@ -368,6 +431,18 @@ fn sanitize_version_folder(raw: &str) -> String {
     }
 }
 
+/// Bumped whenever the on-disk layout produced by this installer changes in a
+/// way that existing installs can't be patched into. A mismatch forces exactly
+/// one clean reinstall, which is safer than inferring brokenness from file
+/// contents — that risks a reinstall loop when the inference is wrong.
+///
+/// rev 2: stopped the AIR runtime shell's root `license.txt` from overwriting
+///        the patch's DevID license in `META-INF/AIR`.
+/// rev 3: the launch path had a duplicate, unguarded copy of that same move and
+///        was clobbering the DevID license on first launch. Installs produced
+///        before this need rebuilding to recover the license.
+const INSTALL_LAYOUT_REVISION: &str = "3";
+
 fn read_installed_version(dir: &Path) -> Option<String> {
     let raw = fs::read_to_string(dir.join("VERSION.txt")).ok()?;
     let v = raw.trim();
@@ -378,9 +453,22 @@ fn read_installed_version(dir: &Path) -> Option<String> {
     }
 }
 
-/// True when the on-disk install matches the remote version identity.
+fn read_layout_revision(dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(dir.join("LAYOUT.txt")).ok()?;
+    let v = raw.trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+/// True when the on-disk install matches the remote version identity *and* was
+/// produced by the current installer layout.
 fn is_version_current(dir: &Path, remote_version: &str) -> bool {
-    is_install_healthy(dir) && read_installed_version(dir).as_deref() == Some(remote_version)
+    is_install_healthy(dir)
+        && read_installed_version(dir).as_deref() == Some(remote_version)
+        && read_layout_revision(dir).as_deref() == Some(INSTALL_LAYOUT_REVISION)
 }
 
 /// Remove a previous install folder after a successful version bump.
@@ -405,6 +493,80 @@ pub async fn ensure_installed(
         return Err("Install pipeline is currently Windows-only".into());
     }
 
+    // Unity and Shockwave builds ship as a plain zip with nothing to patch, so
+    // they skip the whole AIR pipeline (runtime shell, SWF selection, manifest
+    // normalisation, licence handling).
+    match id.kind() {
+        ClientKind::Air => ensure_air_installed(app, root, id, hotel_host).await,
+        ClientKind::Unity | ClientKind::Shockwave => ensure_zip_installed(app, root, id).await,
+    }
+}
+
+/// Install path for Unity / Habbo X / Origins: resolve the version and zip URL
+/// from the platform's own `gamedata/clienturls`, download, extract, done.
+async fn ensure_zip_installed(
+    app: &AppHandle,
+    root: &Path,
+    id: ClientId,
+) -> Result<(String, PathBuf), String> {
+    let platform = id.platform();
+    let host = platform.gamedata_host();
+
+    emit_progress(
+        app,
+        "check",
+        None,
+        format!("Verifying latest {} version…", id.label()),
+    );
+
+    let (version, url) = match id.kind() {
+        ClientKind::Shockwave => fetch_shockwave_clienturls(host).await?,
+        _ => fetch_unity_clienturls(host).await?,
+    };
+    let version = sanitize_version_folder(&version);
+    let dest = client_dir(root, id, &version)?;
+
+    if is_install_healthy_for(id, &dest) && read_installed_version(&dest).as_deref() == Some(&version)
+    {
+        emit_progress(
+            app,
+            "ready",
+            Some(100),
+            format!("{} is up to date ({version})", id.label()),
+        );
+        return Ok((version, dest));
+    }
+
+    if dest.exists() {
+        fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
+    }
+    fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+
+    let zip = dest.join("ClientDownload.zip");
+    download_file(app, &url, &zip, &format!("{} client", id.label())).await?;
+
+    emit_progress(app, "extract", None, format!("Extracting {}…", id.label()));
+    unzip(&zip, &dest, &[])?;
+    let _ = fs::remove_file(&zip);
+
+    if !is_install_healthy_for(id, &dest) {
+        return Err(format!(
+            "{} install finished but the expected executable is missing",
+            id.label()
+        ));
+    }
+
+    fs::write(dest.join("VERSION.txt"), &version).map_err(|e| e.to_string())?;
+    emit_progress(app, "ready", Some(100), "Client ready");
+    Ok((version, dest))
+}
+
+async fn ensure_air_installed(
+    app: &AppHandle,
+    root: &Path,
+    id: ClientId,
+    hotel_host: &str,
+) -> Result<(String, PathBuf), String> {
     emit_progress(
         app,
         "check",
@@ -505,34 +667,128 @@ pub async fn ensure_installed(
     // HabboCustomLauncher forces SWF version 51 on Windows
     set_swf_version(&swf, 51)?;
     fs::write(dest.join("VERSION.txt"), &version).map_err(|e| e.to_string())?;
-    emit_progress(app, "ready", Some(100), "Client ready");
+    fs::write(dest.join("LAYOUT.txt"), INSTALL_LAYOUT_REVISION).map_err(|e| e.to_string())?;
+
+    if has_developer_license(&dest) {
+        emit_progress(app, "ready", Some(100), "Client ready");
+    } else {
+        // Worth surfacing: without a DevID license the AIR app id can't be
+        // rewritten, so every account will share one machine id.
+        emit_progress(
+            app,
+            "ready",
+            Some(100),
+            "Client ready (no developer license — machine-id isolation unavailable)",
+        );
+    }
     Ok((version, dest))
 }
 
 /// Match a working HabboCustomLauncher layout:
 /// META-INF/AIR/application.xml only, no Discord `<extensions>`, no root application.xml.
-fn normalize_air_application_xml(dest: &Path) -> Result<(), String> {
+///
+/// Public because the launch path must apply the exact same normalisation. It
+/// previously had its own copy of this logic, the two drifted, and the launch
+/// copy silently overwrote the DevID license on every run.
+pub fn normalize_air_application_xml(dest: &Path) -> Result<(), String> {
     let meta = dest.join("META-INF").join("AIR").join("application.xml");
     if !meta.is_file() {
         return Ok(());
     }
     let mut xml = fs::read_to_string(&meta).map_err(|e| e.to_string())?;
     xml = strip_extensions_from_string(&xml);
+    xml = clamp_descriptor_namespace(&xml);
     if !xml.contains("<encryptedLocalStorage>") {
         xml = insert_encrypted_local_storage(&xml);
     }
     fs::write(&meta, &xml).map_err(|e| e.to_string())?;
 
+    // The pristine backup is restored over application.xml before every launch,
+    // so it needs the same namespace correction or the fix is undone each time.
+    let backup = dest.join("META-INF").join("AIR").join("application.original.xml");
+    if backup.is_file() {
+        if let Ok(raw) = fs::read_to_string(&backup) {
+            let fixed = clamp_descriptor_namespace(&raw);
+            if fixed != raw {
+                let _ = fs::write(&backup, fixed);
+            }
+        }
+    }
+
     let root = dest.join("application.xml");
     if root.is_file() {
         let _ = fs::remove_file(&root);
     }
+    // Stage a root-level license.txt into META-INF/AIR — but never on top of one
+    // that's already there.
+    //
+    // The client patch zips ship `META-INF/AIR/license.txt`, a HARMAN *DevID*
+    // license which validates against the developer and therefore permits any
+    // application id. The AIR runtime shell zip ships its own root
+    // `license.txt`, an app-id-bound `LIC…` blob. Overwriting the former with
+    // the latter is what previously made a rewritten `<id>` fail with
+    // "invalid license — your application bundle may have been modified",
+    // which in turn cost us per-account machine-id isolation.
     let license = dest.join("license.txt");
     let license_dest = dest.join("META-INF").join("AIR").join("license.txt");
-    if license.is_file() {
-        let _ = fs::rename(license, license_dest);
+    if license.is_file() && !license_dest.is_file() {
+        let _ = fs::rename(&license, &license_dest);
     }
+
+    // Snapshot the clean manifest and stock SWF now, before any launch rewrites
+    // the AIR application id. Doing it here (rather than at swap time) is what
+    // guarantees application.original.xml never contains a stale avatar id.
+    let _ = crate::swf::ensure_backups(dest);
     Ok(())
+}
+
+/// True when the bundle carries a HARMAN **DevID** license.
+///
+/// A DevID license is keyed to the developer, so the application id may be
+/// rewritten freely — which is what per-account machine-id isolation relies on.
+/// An opaque `LIC…` license is bound to one specific application id and must be
+/// left alone.
+pub fn has_developer_license(dir: &Path) -> bool {
+    let path = dir.join("META-INF").join("AIR").join("license.txt");
+    match fs::read_to_string(&path) {
+        Ok(text) => text.trim_start().starts_with("DevID="),
+        // No license at all: nothing binds us to an id, so rewriting is safe.
+        Err(_) => !path.exists(),
+    }
+}
+
+/// Pins the AIR descriptor namespace to `<major>.0`.
+///
+/// `HabboAirPlusPatch.zip` declares `http://ns.adobe.com/air/application/51.3`,
+/// and the AIR runtime it ships alongside (51.3.3.2) *rejects* that namespace:
+/// `Habbo.exe` exits with code 5 immediately — no window, no dialog, nothing in
+/// the event log. Only `<major>.0` namespaces are reliably recognised, which is
+/// what the official Habbo package uses (`51.0`) and why that one works.
+///
+/// Verified experimentally: changing nothing but this makes an otherwise
+/// identical bundle launch.
+fn clamp_descriptor_namespace(xml: &str) -> String {
+    const MARKER: &str = "air/application/";
+    let Some(pos) = xml.find(MARKER) else {
+        return xml.to_string();
+    };
+    let start = pos + MARKER.len();
+    let rest = &xml[start..];
+
+    // Version runs until the closing quote of the xmlns attribute.
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(rest.len());
+    let version = &rest[..end];
+
+    let Some((major, minor)) = version.split_once('.') else {
+        return xml.to_string();
+    };
+    if minor == "0" || major.is_empty() || !major.chars().all(|c| c.is_ascii_digit()) {
+        return xml.to_string();
+    }
+
+    format!("{}{}.0{}", &xml[..start], major, &rest[end..])
 }
 
 fn strip_extensions_from_string(xml: &str) -> String {
@@ -560,7 +816,203 @@ fn insert_encrypted_local_storage(xml: &str) -> String {
     }
 }
 
-/// True when an on-disk install looks complete enough to launch.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_license(dir: &Path, body: &str) {
+        let air = dir.join("META-INF").join("AIR");
+        fs::create_dir_all(&air).unwrap();
+        fs::write(air.join("license.txt"), body).unwrap();
+    }
+
+    #[test]
+    fn devid_license_permits_app_id_rewrite() {
+        let dir = std::env::temp_dir().join(format!("bobba-lic-dev-{}", std::process::id()));
+        write_license(
+            &dir,
+            "DevID=3f60df2a-47e5-4372-bf1b-48448d750304\nLicense=76b68541bbc084a9",
+        );
+        assert!(has_developer_license(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opaque_lic_license_blocks_app_id_rewrite() {
+        let dir = std::env::temp_dir().join(format!("bobba-lic-lic-{}", std::process::id()));
+        write_license(&dir, "LIC3f4cc9f83ea1e63f10c6c8dc8ddc9fec32825bad");
+        assert!(!has_developer_license(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression guard. The AIR runtime shell leaves a root `license.txt`
+    /// (app-id-bound) next to the patch's `META-INF/AIR/license.txt` (DevID).
+    /// Normalisation must never let the former replace the latter — and it must
+    /// hold no matter how many times it runs, since it executes on every launch.
+    #[test]
+    fn normalisation_never_clobbers_the_devid_license() {
+        let dir = std::env::temp_dir().join(format!("bobba-lic-clobber-{}", std::process::id()));
+        let air = dir.join("META-INF").join("AIR");
+        fs::create_dir_all(&air).unwrap();
+
+        fs::write(
+            air.join("application.xml"),
+            "<application><id>com.sulake.habboair</id></application>",
+        )
+        .unwrap();
+        fs::write(air.join("license.txt"), "DevID=abc\nLicense=def").unwrap();
+        fs::write(dir.join("license.txt"), "LIC00000000000000").unwrap();
+
+        for _ in 0..3 {
+            normalize_air_application_xml(&dir).unwrap();
+            assert!(
+                has_developer_license(&dir),
+                "root license.txt overwrote the DevID license"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// When only the root license exists it *should* be staged into META-INF/AIR.
+    #[test]
+    fn normalisation_stages_root_license_when_none_present() {
+        let dir = std::env::temp_dir().join(format!("bobba-lic-stage-{}", std::process::id()));
+        let air = dir.join("META-INF").join("AIR");
+        fs::create_dir_all(&air).unwrap();
+        fs::write(
+            air.join("application.xml"),
+            "<application><id>com.sulake.habboair</id></application>",
+        )
+        .unwrap();
+        fs::write(dir.join("license.txt"), "LIC00000000000000").unwrap();
+
+        normalize_air_application_xml(&dir).unwrap();
+
+        assert!(air.join("license.txt").is_file());
+        assert!(!dir.join("license.txt").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The exact failure seen in the field: namespace 51.3 made AIR exit with
+    /// code 5, and pinning it to 51.0 was the single change that fixed it.
+    #[test]
+    fn descriptor_namespace_is_pinned_to_major_zero() {
+        let xml = r#"<application xmlns="http://ns.adobe.com/air/application/51.3"><id>x</id></application>"#;
+        let out = clamp_descriptor_namespace(xml);
+        assert!(out.contains("air/application/51.0"));
+        assert!(!out.contains("51.3"));
+        // Nothing else may be disturbed.
+        assert!(out.contains("<id>x</id>"));
+    }
+
+    #[test]
+    fn descriptor_namespace_already_major_zero_is_untouched() {
+        let xml = r#"<application xmlns="http://ns.adobe.com/air/application/51.0"><id>x</id></application>"#;
+        assert_eq!(clamp_descriptor_namespace(xml), xml);
+    }
+
+    #[test]
+    fn descriptor_namespace_clamp_is_idempotent_and_safe() {
+        let xml = r#"<application xmlns="http://ns.adobe.com/air/application/52.7"><id>x</id></application>"#;
+        let once = clamp_descriptor_namespace(xml);
+        assert_eq!(clamp_descriptor_namespace(&once), once);
+        assert!(once.contains("air/application/52.0"));
+
+        // No namespace at all: leave the document alone rather than corrupt it.
+        let plain = "<application><id>x</id></application>";
+        assert_eq!(clamp_descriptor_namespace(plain), plain);
+    }
+
+    /// Builds the on-disk shape a freshly extracted AirPlus install has:
+    /// the patch's 51.3 descriptor, the runtime shell's root license.txt and
+    /// root application.xml, and no backup yet.
+    fn staged_install(dir: &Path, with_backup: bool) {
+        let air = dir.join("META-INF").join("AIR");
+        fs::create_dir_all(&air).unwrap();
+
+        let shipped = concat!(
+            r#"<application xmlns="http://ns.adobe.com/air/application/51.3">"#,
+            "<id>com.sulake.habboair</id>",
+            "<extensions><extensionID>com.sulake.discord.richpresence</extensionID></extensions>",
+            "</application>"
+        );
+        fs::write(air.join("application.xml"), shipped).unwrap();
+        if with_backup {
+            fs::write(air.join("application.original.xml"), shipped).unwrap();
+        }
+        // DevID license from the client patch, plus the runtime shell's root one.
+        fs::write(air.join("license.txt"), "DevID=abc\nLicense=def").unwrap();
+        fs::write(dir.join("license.txt"), "LIC00000000").unwrap();
+        fs::write(dir.join("application.xml"), shipped).unwrap();
+        fs::write(dir.join("HabboAir.swf"), b"FWS\x33rest-of-swf").unwrap();
+    }
+
+    fn ns_of(path: &Path) -> String {
+        let raw = fs::read_to_string(path).unwrap();
+        let marker = "air/application/";
+        let start = raw.find(marker).expect("namespace present") + marker.len();
+        let rest = &raw[start..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    /// A full re-download must produce a launchable bundle: corrected namespace
+    /// in the manifest *and* in the backup that gets restored before each launch.
+    #[test]
+    fn fresh_install_produces_a_launchable_descriptor() {
+        let dir = std::env::temp_dir().join(format!("bobba-fresh-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        staged_install(&dir, false);
+
+        normalize_air_application_xml(&dir).unwrap();
+
+        let air = dir.join("META-INF").join("AIR");
+        assert_eq!(ns_of(&air.join("application.xml")), "51.0");
+        // ensure_backups snapshots after the correction, so the backup is clean.
+        assert_eq!(ns_of(&air.join("application.original.xml")), "51.0");
+        // DevID license preserved, staged root copies removed.
+        assert!(has_developer_license(&dir));
+        assert!(!dir.join("application.xml").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An install already on disk with the bad namespace in both files gets
+    /// repaired in place, with no re-download.
+    #[test]
+    fn existing_install_is_repaired_in_place_and_stays_repaired() {
+        let dir = std::env::temp_dir().join(format!("bobba-existing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        staged_install(&dir, true);
+
+        let air = dir.join("META-INF").join("AIR");
+        assert_eq!(ns_of(&air.join("application.original.xml")), "51.3");
+
+        // Runs before every launch, so it must converge and stay converged.
+        for _ in 0..3 {
+            normalize_air_application_xml(&dir).unwrap();
+            assert_eq!(ns_of(&air.join("application.xml")), "51.0");
+            assert_eq!(ns_of(&air.join("application.original.xml")), "51.0");
+            assert!(has_developer_license(&dir));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Nothing binds us to an id when no license is present at all.
+    #[test]
+    fn missing_license_is_treated_as_unrestricted() {
+        let dir = std::env::temp_dir().join(format!("bobba-lic-none-{}", std::process::id()));
+        fs::create_dir_all(dir.join("META-INF").join("AIR")).unwrap();
+        assert!(has_developer_license(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// True when an AIR install looks complete enough to launch.
 pub fn is_install_healthy(dir: &Path) -> bool {
     dir.join("Habbo.exe").is_file()
         && dir.join("HabboAir.swf").is_file()
@@ -571,25 +1023,62 @@ pub fn is_install_healthy(dir: &Path) -> bool {
             .is_file()
 }
 
+/// Executable a Unity build is launched through.
+pub fn unity_exe(dir: &Path) -> PathBuf {
+    dir.join("StandaloneWindows")
+        .join("habbo2020-global-prod.exe")
+}
+
+/// Origins ships one executable per server (`HabboHotel-ous.exe`, `-oes`, `-obr`),
+/// optionally with an `-xl` variant. An install is usable if any of them exist.
+pub fn origins_exe(dir: &Path, server_suffix: &str, xl: bool) -> PathBuf {
+    let xl = if xl { "-xl" } else { "" };
+    dir.join(format!("HabboHotel-o{server_suffix}{xl}.exe"))
+}
+
+fn has_any_origins_exe(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+        name.starts_with("habbohotel-o") && name.ends_with(".exe")
+    })
+}
+
+/// Health check appropriate to the client's packaging.
+pub fn is_install_healthy_for(id: ClientId, dir: &Path) -> bool {
+    match id.kind() {
+        ClientKind::Air => is_install_healthy(dir),
+        ClientKind::Unity => unity_exe(dir).is_file(),
+        ClientKind::Shockwave => has_any_origins_exe(dir),
+    }
+}
+
 /// Resolve an already-installed client directory from settings version.
 pub fn resolve_install(root: &Path, id: ClientId, version: &str) -> Result<PathBuf, String> {
     let dir = client_dir(root, id, version)?;
-    if is_install_healthy(&dir) {
+    if is_install_healthy_for(id, &dir) {
         Ok(dir)
     } else {
         Err("Client is not installed. Click Install / Update first.".into())
     }
 }
 
-/// Repair existing installs to the known-good XML layout before launch.
-pub async fn repair_if_needed(_app: &AppHandle, dir: &Path) -> Result<(), String> {
-    if !dir.join("Habbo.exe").is_file() || !dir.join("HabboAir.swf").is_file() {
-        return Err("Client install is incomplete".into());
+/// Repair existing installs before launch. Only AIR bundles need work — the
+/// manifest normalisation, licence staging and namespace correction all live
+/// there. Unity and Shockwave builds are just verified.
+pub async fn repair_if_needed(_app: &AppHandle, id: ClientId, dir: &Path) -> Result<(), String> {
+    if id.kind() == ClientKind::Air {
+        if !dir.join("Habbo.exe").is_file() || !dir.join("HabboAir.swf").is_file() {
+            return Err("Client install is incomplete".into());
+        }
+        normalize_air_application_xml(dir)?;
     }
-    normalize_air_application_xml(dir)?;
-    if is_install_healthy(dir) {
+
+    if is_install_healthy_for(id, dir) {
         Ok(())
     } else {
-        Err("Client install is incomplete".into())
+        Err(format!("{} install is incomplete", id.label()))
     }
 }

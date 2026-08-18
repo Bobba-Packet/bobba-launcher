@@ -13,9 +13,11 @@
     "windows": [
       {
         "title": "Bobba Launcher",
-        "width": 520,
-        "height": 460,
-        "resizable": false,
+        "width": 640,
+        "height": 640,
+        "minWidth": 560,
+        "minHeight": 520,
+        "resizable": true,
         "maximizable": false,
         "center": true
       }
@@ -43,7 +45,10 @@
     ],
     "windows": {
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "headerImage": "icons/nsis-header.bmp",
+        "sidebarImage": "icons/nsis-sidebar.bmp",
+        "displayLanguageSelector": true
       }
     }
   }
