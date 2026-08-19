@@ -62,7 +62,7 @@ impl Platform {
 
     pub fn default_client(self) -> ClientId {
         match self {
-            Platform::HabboHotel => ClientId::AirPlus,
+            Platform::HabboHotel => ClientId::AirBobba,
             Platform::Origins => ClientId::Origins,
             Platform::HabboX => ClientId::Habbox,
         }

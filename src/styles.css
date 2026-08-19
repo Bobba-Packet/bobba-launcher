@@ -44,3 +44,165 @@ body {
 .font-display {
   font-family: var(--font-display);
 }
+
+.app-shell {
+  position: relative;
+  isolation: isolate;
+}
+
+.app-shell::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.009;
+  background-image: url("/brand/tile-habbo-grid.png");
+  background-repeat: repeat;
+}
+
+.app-shell > * {
+  position: relative;
+  z-index: 1;
+}
+
+.btn-skull {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  cursor: pointer;
+  background-color: var(--color-bp-surface);
+  background-image: url("/brand/tile-bobba-skulls.png");
+  background-repeat: repeat;
+  background-size: 48px 48px;
+}
+
+.btn-skull:disabled {
+  cursor: not-allowed;
+}
+
+.btn-skull::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: #fff;
+  opacity: 0.04;
+  transition: opacity 150ms ease;
+}
+
+.btn-skull:hover:not(:disabled)::before {
+  opacity: 0.07;
+}
+
+.btn-skull:active:not(:disabled)::before {
+  opacity: 0.1;
+}
+
+.btn-skull.is-active::before {
+  opacity: 0.08;
+}
+
+.btn-skull.is-active:hover:not(:disabled)::before {
+  opacity: 0.1;
+}
+
+.settings-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #3a4230 transparent;
+  padding-right: 4px;
+  padding-bottom: 4px;
+}
+
+.settings-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.settings-scroll::-webkit-scrollbar-track {
+  background: transparent;
+  margin-block: 4px;
+}
+
+.settings-scroll::-webkit-scrollbar-thumb {
+  background-color: #3a4230;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.settings-scroll::-webkit-scrollbar-thumb:hover {
+  background-color: var(--color-bp-accent);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.settings-scroll::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.delay-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  display: block;
+  width: 100%;
+  height: 14px;
+  margin: 0;
+  background: transparent;
+  outline: none;
+  cursor: pointer;
+}
+
+.delay-slider::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    var(--color-bp-accent) var(--delay-pct, 0%),
+    var(--color-bp-border) var(--delay-pct, 0%)
+  );
+}
+
+.delay-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: var(--color-bp-fg);
+  border: 2px solid var(--color-bp-accent);
+  box-shadow: 0 0 0 1px #12130f;
+  cursor: pointer;
+  transition:
+    transform 120ms ease,
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+
+.delay-slider:hover::-webkit-slider-thumb,
+.delay-slider:focus-visible::-webkit-slider-thumb {
+  background: #fff;
+  border-color: var(--color-bp-accent-hover);
+  transform: scale(1.12);
+}
+
+.delay-slider::-moz-range-track {
+  height: 6px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    var(--color-bp-accent) var(--delay-pct, 0%),
+    var(--color-bp-border) var(--delay-pct, 0%)
+  );
+}
+
+.delay-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--color-bp-fg);
+  border: 2px solid var(--color-bp-accent);
+  box-shadow: 0 0 0 1px #12130f;
+  cursor: pointer;
+}

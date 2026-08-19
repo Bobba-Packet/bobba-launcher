@@ -86,7 +86,7 @@ fn default_launch_delay() -> u32 {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            selected: ClientId::AirPlus,
+            selected: ClientId::AirBobba,
             platform: Platform::HabboHotel,
             origins_server: OriginsServer::default(),
             origins_xl: false,

@@ -1,6 +1,6 @@
 [package]
 name = "bobba-launcher"
-version = "0.1.4"
+version = "1.0.0"
 description = "Bobba Packet launcher — Classic · AirPlus · Bobba Client"
 authors = ["Bobba Packet"]
 edition = "2021"
