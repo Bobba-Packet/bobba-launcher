@@ -18,9 +18,7 @@ use crate::clients::{ClientId, ClientKind};
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HabboLauncher/1.0.41 BobbaPacketLauncher/0.1";
 
-const AIRPLUS_SWF_URL: &str =
-    "https://github.com/LilithRainbows/HabboAirPlus/releases/download/latest/HabboAir.swf";
-
+const AIRPLUS_GITHUB_REPO: &str = "LilithRainbows/HabboAirPlus";
 const AIRBOBBA_GITHUB_REPO: &str = "Bobba-Packet/bobba-client";
 
 const ASSET_BASE: &str =
@@ -37,6 +35,8 @@ struct GhAsset {
     name: String,
     updated_at: String,
     browser_download_url: String,
+    /// `GET` this with `Accept: application/octet-stream` when the browser URL fails.
+    url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +45,8 @@ struct RemoteClient {
     version: String,
     /// HabboAir.swf download URL (or Classic zip URL).
     client_url: String,
+    /// GitHub release-asset API URL. Fallback when `client_url` cannot be fetched.
+    asset_api_url: Option<String>,
     /// Extra patch zip for AirBobba, if any.
     patch_url: Option<String>,
 }
@@ -91,12 +93,123 @@ fn air_patch_asset() -> &'static str {
     }
 }
 
-fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+/// GitHub release downloads 302 to `release-assets.githubusercontent.com`.
+/// reqwest's default HTTP/2 + webpki-only setup reports that as
+/// "error sending request" on Windows, while WinHTTP/curl still succeed.
+/// HTTP/1.1 plus the OS certificate store matches what already works locally.
+fn client_builder(follow_redirects: bool, ipv4_only: bool) -> reqwest::ClientBuilder {
+    let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(std::time::Duration::from_secs(600))
-        .build()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .http1_only()
+        .redirect(if follow_redirects {
+            reqwest::redirect::Policy::limited(10)
+        } else {
+            reqwest::redirect::Policy::none()
+        });
+    if ipv4_only {
+        builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    }
+    builder
+}
+
+fn describe_reqwest(err: &reqwest::Error) -> String {
+    use std::error::Error;
+    let mut msg = err.to_string();
+    let mut src = err.source().and_then(|first| first.source());
+    while let Some(next) = src {
+        let text = next.to_string();
+        if !msg.contains(&text) {
+            msg.push_str(": ");
+            msg.push_str(&text);
+        }
+        src = next.source();
+    }
+    msg
+}
+
+fn with_accept(req: reqwest::RequestBuilder, accept: Option<&str>) -> reqwest::RequestBuilder {
+    match accept {
+        Some(value) => req.header(reqwest::header::ACCEPT, value),
+        None => req,
+    }
+}
+
+fn resolve_redirect(current: &str, location: &str) -> Result<String, String> {
+    if location.starts_with("https://") || location.starts_with("http://") {
+        return Ok(location.to_string());
+    }
+    let base = reqwest::Url::parse(current).map_err(|e| e.to_string())?;
+    base.join(location)
+        .map(|url| url.to_string())
         .map_err(|e| e.to_string())
+}
+
+fn is_http_redirect(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
+async fn send_following(
+    url: &str,
+    accept: Option<&str>,
+    ipv4_only: bool,
+) -> Result<reqwest::Response, String> {
+    let client = client_builder(true, ipv4_only)
+        .build()
+        .map_err(|e| e.to_string())?;
+    with_accept(client.get(url), accept)
+        .send()
+        .await
+        .map_err(|e| describe_reqwest(&e))
+}
+
+async fn send_manual(
+    url: &str,
+    accept: Option<&str>,
+    ipv4_only: bool,
+) -> Result<reqwest::Response, String> {
+    let client = client_builder(false, ipv4_only)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut current = url.to_string();
+    for _ in 0..10 {
+        let response = with_accept(client.get(&current), accept)
+            .send()
+            .await
+            .map_err(|e| describe_reqwest(&e))?;
+        if !is_http_redirect(response.status()) {
+            return Ok(response);
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| format!("Redirect from {current} had no Location header"))?
+            .to_string();
+        current = resolve_redirect(&current, location.trim())?;
+    }
+    Err(format!("Too many redirects starting at {url}"))
+}
+
+/// Try the normal client, then follow the GitHub redirect ourselves, then force IPv4.
+/// A broken IPv6 route or an HTTP/2 reset otherwise aborts the AirPlus SWF download.
+async fn send_get(url: &str, accept: Option<&str>) -> Result<reqwest::Response, String> {
+    let mut last = String::new();
+    // Automatic redirects first, then the same request with the Location header
+    // applied by hand, then again forced onto IPv4. Stop at the first response.
+    for (manual, ipv4_only) in [(false, false), (true, false), (true, true)] {
+        let attempt = if manual {
+            send_manual(url, accept, ipv4_only).await
+        } else {
+            send_following(url, accept, ipv4_only).await
+        };
+        match attempt {
+            Ok(response) => return Ok(response),
+            Err(err) => last = err,
+        }
+    }
+    Err(last)
 }
 
 /// Public wrapper so other modules (custom SWF) can reuse the progress-reporting
@@ -107,7 +220,32 @@ pub async fn download_to(
     dest: &Path,
     label: &str,
 ) -> Result<(), String> {
-    download_file(app, url, dest, label).await
+    download_file(app, url, dest, label, None).await
+}
+
+async fn download_with_fallback(
+    app: &AppHandle,
+    url: &str,
+    asset_api: Option<&str>,
+    dest: &Path,
+    label: &str,
+) -> Result<(), String> {
+    if let Err(primary) = download_file(app, url, dest, label, None).await {
+        let Some(api) = asset_api else {
+            return Err(primary);
+        };
+        let _ = fs::remove_file(dest);
+        download_file(
+            app,
+            api,
+            dest,
+            label,
+            Some("application/octet-stream"),
+        )
+        .await
+        .map_err(|fallback| format!("{primary}; GitHub asset API fallback failed: {fallback}"))?;
+    }
+    Ok(())
 }
 
 async fn download_file(
@@ -115,19 +253,18 @@ async fn download_file(
     url: &str,
     dest: &Path,
     label: &str,
+    accept: Option<&str>,
 ) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let client = http_client()?;
     emit_progress(app, "download", Some(0), format!("Downloading {label}…"));
-    let response = client
-        .get(url)
-        .send()
+    let response = send_get(url, accept)
         .await
-        .map_err(|e| format!("Download failed ({url}): {e}"))?
+        .map_err(|e| format!("Download failed ({url}): {e}"))?;
+    let response = response
         .error_for_status()
-        .map_err(|e| format!("Download HTTP error ({url}): {e}"))?;
+        .map_err(|e| format!("Download HTTP error ({url}): {}", describe_reqwest(&e)))?;
 
     let total = response.content_length();
     let mut stream = response.bytes_stream();
@@ -154,7 +291,7 @@ async fn download_file(
 async fn download_asset_zip(app: &AppHandle, name: &str, dest_dir: &Path) -> Result<PathBuf, String> {
     let url = format!("{ASSET_BASE}/{name}");
     let zip_path = dest_dir.join(name);
-    download_file(app, &url, &zip_path, name).await?;
+    download_file(app, &url, &zip_path, name, None).await?;
     Ok(zip_path)
 }
 
@@ -238,14 +375,11 @@ async fn fetch_clienturls(host: &str) -> Result<ClientUrlsJson, String> {
         .trim_start_matches("http://")
         .trim_end_matches('/');
     let url = format!("https://{host}/gamedata/clienturls");
-    let client = http_client()?;
-    let text = client
-        .get(&url)
-        .send()
+    let text = send_get(&url, None)
         .await
         .map_err(|e| format!("clienturls request failed ({host}): {e}"))?
         .error_for_status()
-        .map_err(|e| format!("clienturls HTTP error ({host}): {e}"))?
+        .map_err(|e| format!("clienturls HTTP error ({host}): {}", describe_reqwest(&e)))?
         .text()
         .await
         .map_err(|e| e.to_string())?;
@@ -287,36 +421,6 @@ async fn fetch_shockwave_clienturls(host: &str) -> Result<(String, String), Stri
     Ok((version, url))
 }
 
-async fn github_swf_version(swf_url: &str) -> Result<String, String> {
-    // Stable folder name: avoid Utc::now() which created a new broken install on every launch.
-    // Prefer Last-Modified epoch when GitHub returns it; otherwise a fixed pin.
-    let client = http_client()?;
-    let response = client
-        .head(swf_url)
-        .send()
-        .await
-        .map_err(|e| format!("SWF HEAD failed ({swf_url}): {e}"))?;
-    if response.status().is_success() {
-        if let Some(lm) = response.headers().get(reqwest::header::LAST_MODIFIED) {
-            let s = lm.to_str().unwrap_or("");
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(s) {
-                return Ok(dt.timestamp().to_string());
-            }
-        }
-        if let Some(etag) = response.headers().get(reqwest::header::ETAG) {
-            let tag = etag.to_str().unwrap_or("").trim_matches('"');
-            if !tag.is_empty() {
-                let safe: String = tag
-                    .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                    .collect();
-                return Ok(format!("etag_{safe}"));
-            }
-        }
-    }
-    Ok("latest".into())
-}
-
 #[derive(Debug, Clone, Copy)]
 enum SwfClientKind {
     AirPlus,
@@ -334,23 +438,20 @@ async fn resolve_remote_client(
                 RemoteClient {
                     version,
                     client_url,
+                    asset_api_url: None,
                     patch_url: None,
                 },
                 None,
             ))
         }
-        ClientId::AirPlus => {
-            let version = github_swf_version(AIRPLUS_SWF_URL).await?;
-            Ok((
-                RemoteClient {
-                    version,
-                    client_url: AIRPLUS_SWF_URL.to_string(),
-                    patch_url: None,
-                },
-                Some(SwfClientKind::AirPlus),
-            ))
-        }
-        ClientId::AirBobba => Ok((fetch_bobba_client_release().await?, Some(SwfClientKind::AirBobba))),
+        ClientId::AirPlus => Ok((
+            fetch_swf_release(AIRPLUS_GITHUB_REPO, None).await?,
+            Some(SwfClientKind::AirPlus),
+        )),
+        ClientId::AirBobba => Ok((
+            fetch_swf_release(AIRBOBBA_GITHUB_REPO, Some("HabboAirBobbaPatch.zip")).await?,
+            Some(SwfClientKind::AirBobba),
+        )),
         // Unity / Habbo X / Origins never reach here — they install through
         // ensure_zip_installed, which resolves its own URLs.
         other => Err(format!(
@@ -360,21 +461,17 @@ async fn resolve_remote_client(
     }
 }
 
-/// Latest bobba-client GitHub Release — version includes SWF asset stamp so
-/// republished builds on the same tag still trigger a download.
-async fn fetch_bobba_client_release() -> Result<RemoteClient, String> {
-    let url = format!("https://api.github.com/repos/{AIRBOBBA_GITHUB_REPO}/releases/latest");
-    let client = http_client()?;
-    let response = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
+/// Latest GitHub release that ships `HabboAir.swf`. The version includes the
+/// asset timestamp so a republish on the same tag still triggers a download.
+async fn fetch_swf_release(repo: &str, patch_name: Option<&str>) -> Result<RemoteClient, String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let response = send_get(&url, Some("application/vnd.github+json"))
         .await
-        .map_err(|e| format!("bobba-client releases request failed: {e}"))?;
+        .map_err(|e| format!("{repo} releases request failed: {e}"))?;
 
     if !response.status().is_success() {
         return Err(format!(
-            "bobba-client releases request failed ({})",
+            "{repo} releases request failed ({})",
             response.status()
         ));
     }
@@ -382,22 +479,28 @@ async fn fetch_bobba_client_release() -> Result<RemoteClient, String> {
     let release: GhRelease = response
         .json()
         .await
-        .map_err(|e| format!("Invalid bobba-client release JSON: {e}"))?;
+        .map_err(|e| format!("Invalid {repo} release JSON: {e}"))?;
     let tag = release.tag_name.trim();
     if tag.is_empty() {
-        return Err("bobba-client latest release has an empty tag".into());
+        return Err(format!("{repo} latest release has an empty tag"));
     }
 
     let swf = release
         .assets
         .iter()
         .find(|a| a.name.eq_ignore_ascii_case("HabboAir.swf"))
-        .ok_or_else(|| "bobba-client latest release is missing HabboAir.swf".to_string())?;
-    let patch = release
-        .assets
-        .iter()
-        .find(|a| a.name.eq_ignore_ascii_case("HabboAirBobbaPatch.zip"))
-        .ok_or_else(|| "bobba-client latest release is missing HabboAirBobbaPatch.zip".to_string())?;
+        .ok_or_else(|| format!("{repo} latest release is missing HabboAir.swf"))?;
+    let patch_url = match patch_name {
+        Some(name) => {
+            let patch = release
+                .assets
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| format!("{repo} latest release is missing {name}"))?;
+            Some(patch.browser_download_url.clone())
+        }
+        None => None,
+    };
 
     let stamp = asset_version_stamp(&swf.updated_at);
     let version = sanitize_version_folder(&format!("{tag}_{stamp}"));
@@ -405,7 +508,8 @@ async fn fetch_bobba_client_release() -> Result<RemoteClient, String> {
     Ok(RemoteClient {
         version,
         client_url: swf.browser_download_url.clone(),
-        patch_url: Some(patch.browser_download_url.clone()),
+        asset_api_url: Some(swf.url.clone()),
+        patch_url,
     })
 }
 
@@ -543,7 +647,7 @@ async fn ensure_zip_installed(
     fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
 
     let zip = dest.join("ClientDownload.zip");
-    download_file(app, &url, &zip, &format!("{} client", id.label())).await?;
+    download_file(app, &url, &zip, &format!("{} client", id.label()), None).await?;
 
     emit_progress(app, "extract", None, format!("Extracting {}…", id.label()));
     unzip(&zip, &dest, &[])?;
@@ -605,11 +709,18 @@ async fn ensure_air_installed(
     // 1) Download client payload
     let payload_path = if swf_kind.is_some() {
         let swf = dest.join("HabboAir.swf");
-        download_file(app, &remote.client_url, &swf, "HabboAir.swf").await?;
+        download_with_fallback(
+            app,
+            &remote.client_url,
+            remote.asset_api_url.as_deref(),
+            &swf,
+            "HabboAir.swf",
+        )
+        .await?;
         swf
     } else {
         let zip = dest.join("ClientDownload.zip");
-        download_file(app, &remote.client_url, &zip, "official client").await?;
+        download_file(app, &remote.client_url, &zip, "official client", None).await?;
         zip
     };
 
@@ -633,7 +744,7 @@ async fn ensure_air_installed(
                 .as_deref()
                 .ok_or_else(|| "Missing HabboAirBobbaPatch.zip URL".to_string())?;
             let bobba_zip = dest.join("HabboAirBobbaPatch.zip");
-            download_file(app, patch_url, &bobba_zip, "HabboAirBobbaPatch.zip").await?;
+            download_file(app, patch_url, &bobba_zip, "HabboAirBobbaPatch.zip", None).await?;
             unzip(&bobba_zip, &dest, &[])?;
             let _ = fs::remove_file(&bobba_zip);
         }
@@ -666,6 +777,12 @@ async fn ensure_air_installed(
 
     // HabboCustomLauncher forces SWF version 51 on Windows
     set_swf_version(&swf, 51)?;
+    if !is_install_healthy(&dest) {
+        return Err(format!(
+            "{} install is incomplete: Habbo.exe, HabboAir.swf and META-INF/AIR/application.xml are required",
+            id.label()
+        ));
+    }
     fs::write(dest.join("VERSION.txt"), &version).map_err(|e| e.to_string())?;
     fs::write(dest.join("LAYOUT.txt"), INSTALL_LAYOUT_REVISION).map_err(|e| e.to_string())?;
 
@@ -692,23 +809,29 @@ async fn ensure_air_installed(
 /// copy silently overwrote the DevID license on every run.
 pub fn normalize_air_application_xml(dest: &Path) -> Result<(), String> {
     let meta = dest.join("META-INF").join("AIR").join("application.xml");
+    // HabboAirPlusPatch.zip ships icons and local SWFs, but not the AIR
+    // descriptor. The runtime shell leaves application.xml at the bundle root;
+    // AIR only reads META-INF/AIR/application.xml.
     if !meta.is_file() {
-        return Ok(());
+        let root = dest.join("application.xml");
+        if !root.is_file() {
+            return Ok(());
+        }
+        if let Some(parent) = meta.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        fs::copy(&root, &meta).map_err(|e| format!("Failed to stage AIR descriptor: {e}"))?;
     }
     let mut xml = fs::read_to_string(&meta).map_err(|e| e.to_string())?;
-    xml = strip_extensions_from_string(&xml);
-    xml = clamp_descriptor_namespace(&xml);
-    if !xml.contains("<encryptedLocalStorage>") {
-        xml = insert_encrypted_local_storage(&xml);
-    }
+    xml = prepare_air_descriptor(&xml);
     fs::write(&meta, &xml).map_err(|e| e.to_string())?;
 
     // The pristine backup is restored over application.xml before every launch,
-    // so it needs the same namespace correction or the fix is undone each time.
+    // so it needs the same correction or the fix is undone each time.
     let backup = dest.join("META-INF").join("AIR").join("application.original.xml");
     if backup.is_file() {
         if let Ok(raw) = fs::read_to_string(&backup) {
-            let fixed = clamp_descriptor_namespace(&raw);
+            let fixed = prepare_air_descriptor(&raw);
             if fixed != raw {
                 let _ = fs::write(&backup, fixed);
             }
@@ -767,6 +890,24 @@ pub fn has_developer_license(dir: &Path) -> bool {
 ///
 /// Verified experimentally: changing nothing but this makes an otherwise
 /// identical bundle launch.
+fn prepare_air_descriptor(xml: &str) -> String {
+    let mut xml = strip_extensions_from_string(xml);
+    xml = fill_shell_placeholders(&xml);
+    xml = clamp_descriptor_namespace(&xml);
+    if !xml.contains("<encryptedLocalStorage>") {
+        xml = insert_encrypted_local_storage(&xml);
+    }
+    xml
+}
+
+/// The AIR runtime shell ships a template descriptor. Those tokens are not
+/// valid AIR values (`versionNumber` must be numeric, `renderMode` is an enum).
+fn fill_shell_placeholders(xml: &str) -> String {
+    xml.replace("XML_CLIENT_VERSION", "1.0")
+        .replace("XML_CLIENT_RENDER_MODE", "cpu")
+        .replace("XML_CLIENT_RENDER_RESOLUTION", "standard")
+}
+
 fn clamp_descriptor_namespace(xml: &str) -> String {
     const MARKER: &str = "air/application/";
     let Some(pos) = xml.find(MARKER) else {
@@ -891,6 +1032,30 @@ mod tests {
 
         assert!(air.join("license.txt").is_file());
         assert!(!dir.join("license.txt").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_descriptor_is_staged_and_placeholders_filled() {
+        let dir = std::env::temp_dir().join(format!("bobba-air-stage-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("application.xml"),
+            r#"<application xmlns="http://ns.adobe.com/air/application/51.5"><versionNumber>XML_CLIENT_VERSION</versionNumber><renderMode>XML_CLIENT_RENDER_MODE</renderMode><requestedDisplayResolution>XML_CLIENT_RENDER_RESOLUTION</requestedDisplayResolution></application>"#,
+        )
+        .unwrap();
+
+        normalize_air_application_xml(&dir).unwrap();
+
+        let meta = dir.join("META-INF").join("AIR").join("application.xml");
+        let xml = fs::read_to_string(&meta).unwrap();
+        assert!(xml.contains("air/application/51.0"), "{xml}");
+        assert!(xml.contains("<versionNumber>1.0</versionNumber>"), "{xml}");
+        assert!(xml.contains("<renderMode>cpu</renderMode>"), "{xml}");
+        assert!(xml.contains("<requestedDisplayResolution>standard</requestedDisplayResolution>"), "{xml}");
+        assert!(!xml.contains("XML_CLIENT"), "{xml}");
+        assert!(!dir.join("application.xml").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
