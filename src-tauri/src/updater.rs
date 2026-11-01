@@ -6,6 +6,18 @@ use tauri::{AppHandle, Emitter};
 const GITHUB_REPO: &str = "Bobba-Packet/bobba-launcher";
 const USER_AGENT: &str = "Bobba-Launcher";
 
+fn github_client() -> Result<reqwest::Client, String> {
+    // Same constraint as the client installer: GitHub release assets fail under
+    // HTTP/2 on Windows with "error sending request".
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(600))
+        .http1_only()
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LauncherUpdate {
@@ -76,10 +88,7 @@ fn pick_windows_asset(assets: &[GhAsset]) -> Option<&GhAsset> {
 
 pub async fn check_for_update(current_version: &str) -> Result<Option<LauncherUpdate>, String> {
     let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = github_client()?;
 
     let response = client
         .get(&url)
@@ -127,10 +136,7 @@ pub async fn download_and_install(app: &AppHandle, update: &LauncherUpdate) -> R
         }),
     );
 
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = github_client()?;
 
     let response = client
         .get(&update.download_url)
